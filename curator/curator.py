@@ -101,6 +101,8 @@ def make_parser():
     parser.add_argument('-c', '--close', dest='close_older', action='store', help='Close indices older than n TIME_UNITs.', type=int)
     parser.add_argument('-b', '--bloom', dest='bloom_older', action='store', help='Disable bloom filter for indices older than n TIME_UNITs.', type=int)
     parser.add_argument('-g', '--disk-space', dest='disk_space', action='store', help='Delete indices beyond n GIGABYTES.', type=float)
+    parser.add_argument('-k', '--snapshot', dest='snapshot_older', action='store', help='Snapshot (backup) indices older than n TIME_UNITs.', type=int)
+    parser.add_argument('--repository', help='Name of snapshot repository.')
 
     parser.add_argument('--max_num_segments', action='store', help='Maximum number of segments, post-optimize. Default: 2', type=int, default=DEFAULT_ARGS['max_num_segments'])
     parser.add_argument('-o', '--optimize', action='store', help='Optimize (Lucene forceMerge) indices older than n TIME_UNITs.  Must increase timeout to stay connected throughout optimize operation, recommend no less than 3600.', type=int)
@@ -117,7 +119,7 @@ def validate_args(myargs):
     success = True
     messages = []
     if myargs.curation_style == 'time':
-        if not myargs.delete_older and not myargs.close_older and not myargs.bloom_older and not myargs.optimize:
+        if not myargs.delete_older and not myargs.close_older and not myargs.bloom_older and not myargs.optimize and not myargs.snapshot_older:
             success = False
             messages.append('Must specify at least one of --delete, --close, --bloom or --optimize')
         if ((myargs.delete_older and myargs.delete_older < 1) or
@@ -135,6 +137,9 @@ def validate_args(myargs):
         if myargs.optimize and myargs.timeout < 300:
             success = False
             messages.append('Timeout should be much higher for optimize transactions, recommend no less than 3600 seconds')
+        if myargs.snapshot_older and not myargs.repository:
+            success = False
+            messages.append('Need to define repository name for snapshot operations')
     else: # Curation-style is 'space'
         if (myargs.delete_older or myargs.close_older or myargs.bloom_older or myargs.optimize):
             success = False
@@ -277,11 +282,21 @@ def _bloom_index(client, index_name, **kwargs):
     else:
         client.indices.put_settings(index=index_name, body='index.codec.bloom.load=false')
 
+def _backup_index(client, index_name, repository_name, **kwargs):
+    if index_closed(client, index_name): # ES cannot backup a closed index 
+        logger.info('Skipping index {0}: Already closed.'.format(index_name))
+        return True
+    else:
+        # use index_name as the snapshot name as well
+        snapshot_body = '{{indices:"{0}","include_global_state": false}}'.format(index_name)
+        client.snapshot.create(repository=repository_name, snapshot=index_name, body=snapshot_body)
+        
 OP_MAP = {
     'close': (_close_index, {'op': 'close', 'verbed': 'closed', 'gerund': 'Closing'}),
     'delete': (_delete_index, {'op': 'delete', 'verbed': 'deleted', 'gerund': 'Deleting'}),
     'optimize': (_optimize_index, {'op': 'optimize', 'verbed': 'optimized', 'gerund': 'Optimizing'}),
     'bloom': (_bloom_index, {'op': 'disable bloom filter for', 'verbed': 'bloom filter disabled', 'gerund': 'Disabling bloom filter for'}),
+    'snapshot': (_backup_index, {'op': 'snapshot', 'verbed': 'completed snapshot', 'gerund': 'Performing snapshot'}),
 }
 
 def index_loop(client, operation, expired_indices, dry_run=False, by_space=False, **kwargs):
@@ -298,7 +313,7 @@ def index_loop(client, operation, expired_indices, dry_run=False, by_space=False
             logger.info('Attempting to {0} index {1} because it is {2} older than cutoff.'.format(words['op'], index_name, expiration))
         else:
             logger.info('Attempting {0} index {1} due to space constraints.'.format(words['gerund'].lower(), index_name))
-
+        
         skipped = op(client, index_name, **kwargs)
 
         if skipped:
@@ -351,7 +366,14 @@ def main():
         print('ERROR: Incompatible with version {0} of Elasticsearch.  Exiting.'.format(".".join(map(str,version_number))))
         sys.exit(1)
 
-    # Delete by space first
+    # Snapshot by time
+    if arguments.snapshot_older:
+        logger.info('Backuping indices older than {0} {1}...'.format(arguments.snapshot_older, arguments.time_unit))
+        expired_indices = find_expired_indices(client, time_unit=arguments.time_unit, unit_count=arguments.snapshot_older, separator=arguments.separator, prefix=arguments.prefix)        
+        #kwargs = {'repository_name' : arguments.repository}
+        index_loop(client, 'snapshot', expired_indices, arguments.dry_run, repository_name=arguments.repository)
+
+    # Delete by space 
     if arguments.disk_space:
         logger.info('Deleting indices by disk usage over {0} gigabytes'.format(arguments.disk_space))
         expired_indices = find_overusage_indices(client, arguments.disk_space, arguments.separator, arguments.prefix)
@@ -383,3 +405,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# sys.argv = [sys.argv[0], '--host', 'devops.ftb-direct.com', '-k', '30', '--dry-run']
