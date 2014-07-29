@@ -70,7 +70,7 @@ DEFAULT_ARGS = {
     'max_num_segments': 2,
     'dry_run': False,
     'debug': False,
-}
+} 
 
 def make_parser():
     """ Creates an ArgumentParser to parse the command line options. """
