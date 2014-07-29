@@ -101,7 +101,7 @@ def make_parser():
     parser.add_argument('-c', '--close', dest='close_older', action='store', help='Close indices older than n TIME_UNITs.', type=int)
     parser.add_argument('-b', '--bloom', dest='bloom_older', action='store', help='Disable bloom filter for indices older than n TIME_UNITs.', type=int)
     parser.add_argument('-g', '--disk-space', dest='disk_space', action='store', help='Delete indices beyond n GIGABYTES.', type=float)
-    parser.add_argument('-k', '--snapshot', dest='snapshot_older', action='store', help='Snapshot (backup) indices older than n TIME_UNITs.', type=int)
+    parser.add_argument('-k', '--snapshot', dest='snapshot_older', action='store', help='Snapshot (backup) index older than n TIME_UNITs.', type=int)
     parser.add_argument('--repository', help='Name of snapshot repository.')
 
     parser.add_argument('--max_num_segments', action='store', help='Maximum number of segments, post-optimize. Default: 2', type=int, default=DEFAULT_ARGS['max_num_segments'])
@@ -283,13 +283,30 @@ def _bloom_index(client, index_name, **kwargs):
         client.indices.put_settings(index=index_name, body='index.codec.bloom.load=false')
 
 def _backup_index(client, index_name, repository_name, **kwargs):
-    if index_closed(client, index_name): # ES cannot backup a closed index 
-        logger.info('Skipping index {0}: Already closed.'.format(index_name))
+    snapshot_name = 'snapshot-on-{0}'.format(time.strftime('%Y.%m.%d'))
+    snapshot_body = '{{indices:"{0}","include_global_state": false,"ignore_unavailable": false}}'.format(index_name)
+    client.snapshot.create(repository=repository_name, snapshot=snapshot_name, body=snapshot_body)
+
+def backup_multiple_indices(client, operation, expired_indices, dry_run=False, **kwargs):
+    index_names = ''
+    for index_name, expiration in expired_indices:
+        if index_closed(client, index_name): # ES cannot backup a closed index 
+            logger.info('Skipping index {0}: Already closed.'.format(index_name))
+        else:
+            index_names = index_names + ',' + index_name
+        
+    if index_names == '':
+        logger.info('No index found')
         return True
-    else:
-        # use index_name as the snapshot name as well
-        snapshot_body = '{{indices:"{0}","include_global_state": false}}'.format(index_name)
-        client.snapshot.create(repository=repository_name, snapshot=index_name, body=snapshot_body)
+
+    index_names = index_names[1:]
+    if dry_run:
+        logger.info('Would have attempted to backup index {0} because they are older than the calculated cutoff.'.format(index_names))
+        return True    
+
+    logger.info('Attempting to backup index {0} because they are older than cutoff.'.format(index_names))
+    return _backup_index(client, index_names, **kwargs)
+
         
 OP_MAP = {
     'close': (_close_index, {'op': 'close', 'verbed': 'closed', 'gerund': 'Closing'}),
@@ -301,7 +318,8 @@ OP_MAP = {
 
 def index_loop(client, operation, expired_indices, dry_run=False, by_space=False, **kwargs):
     op, words = OP_MAP[operation]
-    for index_name, expiration in expired_indices:
+    for index_name, expiration in expired_indices:       
+        
         if dry_run and not by_space:
             logger.info('Would have attempted {0} index {1} because it is {2} older than the calculated cutoff.'.format(words['gerund'].lower(), index_name, expiration))
             continue
@@ -315,15 +333,15 @@ def index_loop(client, operation, expired_indices, dry_run=False, by_space=False
             logger.info('Attempting {0} index {1} due to space constraints.'.format(words['gerund'].lower(), index_name))
         
         skipped = op(client, index_name, **kwargs)
-
+                
+        
         if skipped:
             continue
 
         # if no error was raised and we got here that means the operation succeeded
         logger.info('{0}: Successfully {1}.'.format(index_name, words['verbed']))
     logger.info('{0} index operations completed.'.format(words['op'].upper()))
-
-
+        
 def get_segmentcount(client, index_name):
     """Return a list of shardcount, segmentcount"""
     shards = client.indices.segments(index=index_name)['indices'][index_name]['shards']
@@ -365,14 +383,7 @@ def main():
         print('Expected Elasticsearch version range > {0} < {1}'.format(".".join(map(str,version_min)),".".join(map(str,version_max))))
         print('ERROR: Incompatible with version {0} of Elasticsearch.  Exiting.'.format(".".join(map(str,version_number))))
         sys.exit(1)
-
-    # Snapshot by time
-    if arguments.snapshot_older:
-        logger.info('Backuping indices older than {0} {1}...'.format(arguments.snapshot_older, arguments.time_unit))
-        expired_indices = find_expired_indices(client, time_unit=arguments.time_unit, unit_count=arguments.snapshot_older, separator=arguments.separator, prefix=arguments.prefix)        
-        #kwargs = {'repository_name' : arguments.repository}
-        index_loop(client, 'snapshot', expired_indices, arguments.dry_run, repository_name=arguments.repository)
-
+    
     # Delete by space 
     if arguments.disk_space:
         logger.info('Deleting indices by disk usage over {0} gigabytes'.format(arguments.disk_space))
@@ -398,6 +409,12 @@ def main():
         logger.info('Optimizing indices older than {0} {1}...'.format(arguments.optimize, arguments.time_unit))
         expired_indices = find_expired_indices(client, time_unit=arguments.time_unit, unit_count=arguments.optimize, separator=arguments.separator, prefix=arguments.prefix)
         index_loop(client, 'optimize', expired_indices, arguments.dry_run)
+
+    # Snapshot by time
+    if arguments.snapshot_older:
+        logger.info('Backuping indices older than {0} {1}...'.format(arguments.snapshot_older, arguments.time_unit))
+        expired_indices = find_expired_indices(client, time_unit=arguments.time_unit, unit_count=arguments.snapshot_older, separator=arguments.separator, prefix=arguments.prefix)                
+        backup_multiple_indices(client, 'snapshot', expired_indices, arguments.dry_run, repository_name=arguments.repository)
 
 
     logger.info('Done in {0}.'.format(timedelta(seconds=time.time()-start)))
